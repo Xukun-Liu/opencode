@@ -7,6 +7,7 @@ import { Directory, Document, type Entry, Info } from "@opencode/schema/config"
 import { ConfigSkillPlugin } from "@opencode/core/config/plugin/skill"
 import { ConfigCompatibilityPlugin } from "@opencode/core/config/plugin/compatibility"
 import { SkillFile } from "@opencode/core/config/plugin/skill-file"
+import { SkillScan } from "@opencode/core/config/plugin/skill-scan"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Watcher } from "@opencode/core/filesystem/watcher"
 import { Bus } from "@opencode/core/bus"
@@ -31,6 +32,7 @@ const it = testEffect(
   Layer.merge(AppNodeBuilder.build(LayerNode.group([Skill.node, Bus.node, FSUtil.node])), watcherLayer),
 )
 const decode = Schema.decodeUnknownSync(Info)
+const directoryWatch = (path: string) => ({ path, type: "directory" as const, ignore: SkillScan.ignore })
 
 function write(directory: string, name: string, description: string) {
   return fs.writeFile(
@@ -205,7 +207,7 @@ describe("ConfigSkillPlugin.Plugin", () => {
             { claude: [AbsolutePath.make(claude)], agents: [AbsolutePath.make(agents)] },
           )
           const watcher = yield* Watcher.Test
-          expect(yield* watcher.subscriptions()).toEqual(expected.map((item) => ({ path: item, type: "directory" })))
+          expect(yield* watcher.subscriptions()).toEqual(expected.map(directoryWatch))
         }),
       ),
     ),
@@ -335,7 +337,7 @@ describe("ConfigSkillPlugin.Plugin", () => {
     ),
   )
 
-  it.live("watches canonical directories behind symlinked skills", () =>
+  it.live("watches canonical skill files behind symlinked skill directories", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
       Effect.flatMap((tmp) =>
         Effect.gen(function* () {
@@ -352,7 +354,7 @@ describe("ConfigSkillPlugin.Plugin", () => {
           const skill = yield* start([source], tmp.path)
           const watcher = yield* Watcher.Test
           expect((yield* skill.list()).find((item) => item.id === "bro")?.description).toBe("Initial")
-          expect(yield* watcher.subscriptions()).toContainEqual({ path: target, type: "directory" })
+          expect(yield* watcher.subscriptions()).toEqual([directoryWatch(source), { path: file, type: "file" }])
 
           yield* Effect.promise(() => fs.writeFile(file, "---\nname: bro\ndescription: Updated\n---\n# bro"))
           yield* emitAndWait({ type: "update", path: file })
@@ -380,10 +382,7 @@ describe("ConfigSkillPlugin.Plugin", () => {
           const skill = yield* start([source], tmp.path)
           const watcher = yield* Watcher.Test
           expect((yield* skill.list()).find((item) => item.id === "bro")?.description).toBe("First")
-          expect(yield* watcher.subscriptions()).toEqual([
-            { path: first, type: "directory" },
-            { path: source, type: "file" },
-          ])
+          expect(yield* watcher.subscriptions()).toEqual([directoryWatch(first), { path: source, type: "file" }])
 
           yield* Effect.promise(async () => {
             await fs.unlink(source)
@@ -393,9 +392,9 @@ describe("ConfigSkillPlugin.Plugin", () => {
 
           expect((yield* skill.list()).find((item) => item.id === "bro")?.description).toBe("Second")
           expect(yield* watcher.subscriptions()).toEqual([
-            { path: first, type: "directory" },
+            directoryWatch(first),
             { path: source, type: "file" },
-            { path: second, type: "directory" },
+            directoryWatch(second),
             { path: source, type: "file" },
           ])
         }),
@@ -421,6 +420,279 @@ describe("ConfigSkillPlugin.Plugin", () => {
           })
           yield* emitAndWait({ type: "create", path: source })
           expect((yield* skill.list()).map((item) => item.id)).toEqual([Skill.ID.make("deploy")])
+        }),
+      ),
+    ),
+  )
+
+  it.live("treats a directory with SKILL.md as one skill", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(tmp.path, "frontend", "react"), { recursive: true })
+            await fs.mkdir(path.join(tmp.path, "pdf", "examples"), { recursive: true })
+            await write(path.join(tmp.path, "frontend"), "react", "React")
+            await write(tmp.path, "pdf", "PDF")
+            await write(path.join(tmp.path, "pdf"), "examples", "Template")
+            await fs.writeFile(path.join(tmp.path, "pdf", "reference.md"), "---\ndescription: Reference\n---\n# ref")
+          })
+
+          const skill = yield* start([tmp.path], tmp.path)
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("pdf"),
+            Skill.ID.make("react"),
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("loads downloaded skill roots by SKILL.md or root markdown", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const review = path.join(tmp.path, "review")
+          const deploy = path.join(tmp.path, "deploy")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(review, "references", "nested"), { recursive: true })
+            await fs.mkdir(deploy, { recursive: true })
+            await fs.writeFile(path.join(review, "SKILL.md"), "---\ndescription: Review\n---\n# review")
+            await fs.writeFile(path.join(review, "notes.md"), "---\ndescription: Notes\n---\n# notes")
+            await write(path.join(review, "references"), "nested", "Nested")
+            await fs.writeFile(path.join(deploy, "deploy.md"), "---\ndescription: Deploy\n---\n# deploy")
+          })
+          const discovery = SkillDiscovery.Service.of({
+            pull: () => Effect.succeed([AbsolutePath.make(review), AbsolutePath.make(deploy)]),
+          })
+
+          const skill = yield* start(["https://example.test/skills/"], tmp.path, discovery)
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("deploy"),
+            Skill.ID.make("review"),
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("loads every name that links to the same skill directory", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(tmp.path, "review"), { recursive: true })
+            await write(tmp.path, "review", "Review")
+            await fs.symlink(
+              path.join(tmp.path, "review"),
+              path.join(tmp.path, "audit"),
+              process.platform === "win32" ? "junction" : undefined,
+            )
+          })
+
+          const skill = yield* start([tmp.path], tmp.path)
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("audit"),
+            Skill.ID.make("review"),
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("watches symlinked grouping directories for new skills", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const source = path.join(tmp.path, "skills")
+          const team = path.join(tmp.path, "dotfiles", "team")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(source, { recursive: true })
+            await fs.mkdir(path.join(team, "review"), { recursive: true })
+            await write(team, "review", "Review")
+            await fs.symlink(team, path.join(source, "team"), process.platform === "win32" ? "junction" : undefined)
+          })
+
+          const skill = yield* start([source], tmp.path)
+          const watcher = yield* Watcher.Test
+          expect((yield* skill.list()).map((item) => item.id)).toEqual([Skill.ID.make("review")])
+          expect(yield* watcher.subscriptions()).toEqual([directoryWatch(source), directoryWatch(team)])
+
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(team, "deploy"), { recursive: true })
+            await write(team, "deploy", "Deploy")
+          })
+          yield* emitAndWait({ type: "create", path: path.join(team, "deploy", "SKILL.md") })
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("deploy"),
+            Skill.ID.make("review"),
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("skips hidden entries and node_modules below the source root", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const source = path.join(tmp.path, ".config", "skills")
+          yield* Effect.promise(async () => {
+            for (const directory of [
+              path.join(source, "review"),
+              path.join(source, ".experimental", "hidden"),
+              path.join(source, "node_modules", "dependency"),
+              path.join(source, "group", "node_modules", "nested"),
+            ])
+              await fs.mkdir(directory, { recursive: true })
+            await write(source, "review", "Review")
+            await write(path.join(source, ".experimental"), "hidden", "Hidden")
+            await write(path.join(source, "node_modules"), "dependency", "Dependency")
+            await write(path.join(source, "group", "node_modules"), "nested", "Nested")
+            await fs.writeFile(path.join(source, "deploy.md"), "---\ndescription: Deploy\n---\n# deploy")
+            await fs.writeFile(path.join(source, ".draft.md"), "---\ndescription: Draft\n---\n# draft")
+          })
+
+          const skill = yield* start([source], tmp.path)
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("deploy"),
+            Skill.ID.make("review"),
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("finishes scanning sources with symlink cycles", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const group = path.join(tmp.path, "group")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(group, "review"), { recursive: true })
+            await write(group, "review", "Review")
+            const type = process.platform === "win32" ? "junction" : undefined
+            await fs.symlink(group, path.join(group, "loop"), type)
+            await fs.symlink(tmp.path, path.join(group, "root"), type)
+          })
+
+          const skill = yield* start([tmp.path], tmp.path)
+          expect((yield* skill.list()).map((item) => item.id)).toEqual([Skill.ID.make("review")])
+        }),
+      ),
+    ),
+  )
+
+  it.live("watches skill files symlinked into a shared store without watching the store", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const source = path.join(tmp.path, "skills")
+          const store = path.join(tmp.path, "store")
+          const file = path.join(store, "abc-expert-SKILL.md")
+          const link = path.join(source, "expert", "SKILL.md")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.dirname(link), { recursive: true })
+            await fs.mkdir(path.join(store, "unrelated", "nested"), { recursive: true })
+            await fs.writeFile(file, "---\nname: expert\ndescription: Initial\n---\n# expert")
+            await fs.symlink(file, link)
+          })
+
+          const skill = yield* start([source], tmp.path)
+          const watcher = yield* Watcher.Test
+          expect((yield* skill.list()).find((item) => item.id === "expert")?.description).toBe("Initial")
+          expect(yield* watcher.subscriptions()).toEqual([directoryWatch(source), { path: file, type: "file" }])
+
+          yield* Effect.promise(async () => {
+            await fs.writeFile(`${file}.new`, "---\nname: expert\ndescription: Replaced\n---\n# expert")
+            await fs.rename(`${file}.new`, file)
+          })
+          yield* emitAndWait({ type: "update", path: file })
+          expect((yield* skill.list()).find((item) => item.id === "expert")?.description).toBe("Replaced")
+
+          const second = path.join(store, "def-expert-SKILL.md")
+          yield* Effect.promise(async () => {
+            await fs.writeFile(second, "---\nname: expert\ndescription: Retargeted\n---\n# expert")
+            await fs.unlink(link)
+            await fs.symlink(second, link)
+          })
+          yield* emitAndWait({ type: "update", path: link })
+          expect((yield* skill.list()).find((item) => item.id === "expert")?.description).toBe("Retargeted")
+          expect(yield* watcher.subscriptions()).toContainEqual({ path: second, type: "file" })
+          expect(yield* watcher.subscriptions()).not.toContainEqual(directoryWatch(store))
+        }),
+      ),
+    ),
+  )
+
+  it.live("stops at the depth limit and avoids recursive watches on truncated sources", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const source = path.join(tmp.path, "skills")
+          const external = path.join(tmp.path, "external")
+          const parent = path.join(source, "1", "2", "3", "4", "5")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(parent, "six"), { recursive: true })
+            await fs.mkdir(path.join(parent, "6", "seven"), { recursive: true })
+            await fs.mkdir(path.join(external, "linked"), { recursive: true })
+            await write(parent, "six", "Depth six")
+            await write(path.join(parent, "6"), "seven", "Depth seven")
+            await write(external, "linked", "Linked")
+            await fs.symlink(
+              external,
+              path.join(source, "external"),
+              process.platform === "win32" ? "junction" : undefined,
+            )
+          })
+
+          const skill = yield* start([source], tmp.path)
+          const watcher = yield* Watcher.Test
+          expect((yield* skill.list()).map((item) => item.id).toSorted()).toEqual([
+            Skill.ID.make("linked"),
+            Skill.ID.make("six"),
+          ])
+          expect(yield* watcher.subscriptions()).toEqual([
+            directoryWatch(source),
+            { path: path.join(external, "linked", "SKILL.md"), type: "file" },
+          ])
+        }),
+      ),
+    ),
+  )
+
+  it.live("watches compatibility skills behind symlinked directories", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const claude = path.join(tmp.path, "claude")
+          const target = path.join(tmp.path, "dotfiles", "bro")
+          const file = path.join(target, "SKILL.md")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(claude, "skills"), { recursive: true })
+            await fs.mkdir(target, { recursive: true })
+            await fs.writeFile(file, "---\nname: bro\ndescription: Initial\n---\n# bro")
+            await fs.symlink(
+              target,
+              path.join(claude, "skills", "bro"),
+              process.platform === "win32" ? "junction" : undefined,
+            )
+          })
+
+          const skill = yield* startEntries([], tmp.path, tmp.path, emptyDiscovery, {
+            claude: [AbsolutePath.make(claude)],
+            agents: [],
+          })
+          const watcher = yield* Watcher.Test
+          expect((yield* skill.list()).find((item) => item.id === "bro")?.description).toBe("Initial")
+          expect(yield* watcher.subscriptions()).toEqual([
+            directoryWatch(path.join(claude, "skills")),
+            { path: file, type: "file" },
+          ])
+
+          yield* Effect.promise(() => fs.writeFile(file, "---\nname: bro\ndescription: Updated\n---\n# bro"))
+          yield* emitAndWait({ type: "update", path: file })
+          expect((yield* skill.list()).find((item) => item.id === "bro")?.description).toBe("Updated")
         }),
       ),
     ),

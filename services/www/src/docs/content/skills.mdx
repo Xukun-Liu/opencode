@@ -59,7 +59,10 @@ skills/
 ```
 
 - Markdown files must be at the source root, such as `skills/review.md`.
-- Files named exactly `SKILL.md` can be at any depth, such as `skills/git-release/SKILL.md`.
+- Files named exactly `SKILL.md` can be nested in grouping directories, such as `skills/git-release/SKILL.md` or `skills/teams/release/SKILL.md`.
+- A directory containing `SKILL.md` is one skill. OpenCode does not search inside it for more skills, so it can hold scripts, references, and dependencies.
+- Hidden files and directories and `node_modules` below the source root are skipped.
+- Symlinked skill files and directories are followed. Search stops six directories below the source root.
 
 ## Sources
 
@@ -232,7 +235,7 @@ For example, this skill's ID is `release`, not its frontmatter name `Git Release
 
 If a skill is missing or loads the wrong content:
 
-1. Confirm the file is either a root-level `*.md` or a nested file named exactly `SKILL.md`.
+1. Confirm the file is either a root-level `*.md` or a nested file named exactly `SKILL.md`, outside hidden directories, `node_modules`, and other skill directories.
 2. Check the path-derived, case-sensitive ID rather than the frontmatter `name`.
 3. Add a `description` if the model should discover the skill.
 4. Check `opencode/autoinvoke` and the selected agent's `skill` permissions.
